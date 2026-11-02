@@ -104,6 +104,15 @@ public interface IResonanceDashboardClient
     Task ReceiveSystemStateChangeAsync(ResonanceSystemState state);
 }
 
+[Authorize(Policy = "ViewResonanceTelemetry")]
+public class ResonanceHub : Hub<IResonanceDashboardClient>
+{
+    public override async Task OnConnectedAsync()
+    {
+        await base.OnConnectedAsync();
+    }
+}
+
 public class ApexResonanceHolon : IObserver<ResonanceTelemetry>
 {
     private readonly IHubContext<ResonanceHub, IResonanceDashboardClient> _hubContext;
@@ -150,7 +159,7 @@ To guarantee strict First-In-First-Out (FIFO) ordering across the Leaf Holons:
 
 1. **Sessionful Ingestion:** Background services (`IHostedService`) running in Azure Container Apps consume telemetry via `ServiceBusSessionProcessor` from the `Azure.Messaging.ServiceBus` SDK, locking session states to specific sensor arrays.
 2. **Secret Management:** Connection strings and signing certificates are dynamically resolved via Azure Key Vault integration.
-3. **Fault Tolerance:** Polly v8 resilience pipelines wrap both the session processors and inter-holon evaluations with circuit breakers and exponential backoff, preventing transient network drops or ML inference spikes from corrupting session state.
+3. **Fault Tolerance:** Polly resilience pipelines wrap both the session processors and inter-holon evaluations with circuit breakers and exponential backoff, preventing transient network drops or ML inference spikes from corrupting session state.
 
 ---
 
@@ -216,6 +225,43 @@ when {
     principal.department == "DevSecOps" &&
     principal.isPrivilegedSession == true
 };
+```
+
+### 3. MediatR Pipeline Orchestration
+
+```csharp
+public class GraphValidatedAuthorizationBehavior<TRequest, TResponse> 
+    : IPipelineBehavior<TRequest, TResponse> where TRequest : ISecuredRequest
+{
+    private readonly IGraphValidator _shaclValidator;
+    private readonly ICedarEngine _cedarEngine;
+    private readonly IAttributeHydrator _hydrator;
+
+    public async Task<TResponse> Handle(TRequest request, RequestHandlerDelegate<TResponse> next, CancellationToken ct)
+    {
+        var contextGraph = await _hydrator.BuildRequestGraphAsync(request);
+
+        var validationReport = _shaclValidator.Validate(contextGraph, "ResonanceSecurityShapes.ttl");
+        if (!validationReport.Conforms)
+        {
+            throw new MalformedSecurityContextException(validationReport.Violations);
+        }
+
+        var cedarContext = contextGraph.ToCedarContext();
+        var authResult = await _cedarEngine.IsAuthorizedAsync(
+            request.Principal, 
+            request.Action, 
+            request.Resource, 
+            cedarContext);
+
+        if (!authResult.IsAllowed)
+        {
+            throw new UnauthorizedAccessException("Cedar policy evaluation denied access.");
+        }
+
+        return await next();
+    }
+}
 ```
 
 ---
